@@ -2,7 +2,7 @@ import logging, time, json, socket
 from collections import MutableMapping
 import requests.exceptions as rexc
 from .utils import urlpathjoin, xauth
-from .serialization import jlencode, jldecode
+from .serialization import jlencode, jldecode, mpdecode
 
 logger = logging.getLogger('hubstorage.resourcetype')
 
@@ -18,6 +18,23 @@ class ResourceType(object):
         self.auth = xauth(auth) or client.auth
         self.url = urlpathjoin(client.endpoint, self.key)
 
+    @property
+    def _supports_msgpack(self):
+        return self.resource_type in ['items', 'logs',
+                                      'collections', 'samples']
+
+    @staticmethod
+    def _enforce_msgpack(**kwargs):
+        kwargs['stream'] = True
+        kwargs.setdefault('headers', {})
+        kwargs['headers']['Accept'] = 'application/x-msgpack'
+        return kwargs
+
+    def _content(self, _path, **kwargs):
+        kwargs['url'] = urlpathjoin(self.url, _path)
+        kwargs.setdefault('auth', self.auth)
+        return self.client.request(**kwargs).content
+
     def _iter_lines(self, _path, **kwargs):
         kwargs['url'] = urlpathjoin(self.url, _path)
         kwargs.setdefault('auth', self.auth)
@@ -29,6 +46,9 @@ class ResourceType(object):
         return r.iter_lines()
 
     def apirequest(self, _path=None, **kwargs):
+        if self._supports_msgpack and kwargs.get('method') == 'GET':
+            kwargs = self._enforce_msgpack(**kwargs)
+            return mpdecode(self._content(_path=_path, **kwargs))
         return jldecode(self._iter_lines(_path, **kwargs))
 
     def apipost(self, _path=None, **kwargs):
@@ -65,9 +85,36 @@ class DownloadableResource(ResourceType):
     def iter_values(self, *args, **kwargs):
         """Reliably iterate through all data as python objects
 
-        calls iter_json, decoding the results
+        calls either iter_json or iter_msgpack, decoding the results
         """
+        if self._supports_msgpack:
+            return mpdecode(self.iter_msgpack(*args, **kwargs))
         return jldecode(self.iter_json(*args, **kwargs))
+
+    def iter_msgpack(self, _path=None, requests_params=None, **apiparams):
+        """Reliably iterate through all data as json strings"""
+        requests_params = dict(requests_params or {})
+        requests_params.setdefault('method', 'GET')
+        requests_params = self._enforce_msgpack(**requests_params)
+        lastexc = None
+        for attempt in xrange(self.MAX_RETRIES):
+            try:
+                return self._content(_path=_path, params=apiparams,
+                                     **requests_params)
+            except (ValueError, socket.error, rexc.RequestException) as exc:
+                # catch requests exceptions other than HTTPError
+                if isinstance(exc, rexc.HTTPError):
+                    raise
+                lastexc = exc
+                url = urlpathjoin(self.url, _path)
+                msg = 'Retrying read of %s in %ds: attempt=%d/%d error=%s'
+                args = url, self.RETRY_INTERVAL, attempt, self.MAX_RETRIES, exc
+                logger.debug(msg, *args)
+                time.sleep(self.RETRY_INTERVAL)
+        url = urlpathjoin(self.url, _path)
+        logger.error('Failed %d times reading items from %s, params %s, '
+                     'last error was: %s', self.MAX_RETRIES, url,
+                     apiparams, lastexc)
 
     def iter_json(self, _path=None, requests_params=None, **apiparams):
         """Reliably iterate through all data as json strings"""

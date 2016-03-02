@@ -1,4 +1,6 @@
+from io import BytesIO
 from json import dumps, loads
+from msgpack import Unpacker
 from datetime import datetime
 
 EPOCH = datetime.utcfromtimestamp(0)
@@ -14,6 +16,11 @@ def jlencode(iterable):
 def jldecode(lineiterable):
     for line in lineiterable:
         yield loads(line)
+
+
+def mpdecode(content):
+    for obj in Unpacker(BytesIO(content), encoding='utf8'):
+        yield obj
 
 
 def jsonencode(o):
